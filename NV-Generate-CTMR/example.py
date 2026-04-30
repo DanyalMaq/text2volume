@@ -40,6 +40,7 @@ if directory is not None:
 root_dir = tempfile.mkdtemp() if directory is None else directory
 
 args = argparse.Namespace()
+args.output_dir = "./datasets/rexgrounding/train_12_a_2/generated"
 
 if generate_version == "ddpm-ct":
     environment_file = "./configs/environment_ddpm-ct.json"
@@ -62,7 +63,7 @@ for k, v in model_def.items():
     setattr(args, k, v)
 
 # check the format of inference inputs
-config_infer_file = "./configs/config_infer.json"
+config_infer_file = "./datasets/rexgrounding/train_12_a_2/config_mask1.json"
 with open(config_infer_file, "r") as f:
     config_infer_dict = json.load(f)
 for k, v in config_infer_dict.items():

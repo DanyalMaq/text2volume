@@ -33,6 +33,12 @@ from .augmentation import remove_tumors
 from .diff_model_setting import load_config
 from .utils import binarize_labels, define_instance, prepare_maisi_controlnet_json_dataloader, setup_ddp
 
+from .text_conditioning import (
+    FrozenClinicalBERT,
+    TextToControlChannels,
+    build_text_control_channels,
+)
+
 
 def remove_roi(labels):
     """
@@ -137,6 +143,14 @@ def compute_model_output(
     top_region_index_tensor=None,
     bottom_region_index_tensor=None,
     return_controlnet_blocks=False,
+    text_prompts=None,
+    text_encoder=None,
+    text_projector=None,
+    text_condition_num_channels=8,
+    text_condition_mode="roi_gated",
+    target_text_labels=None,
+    text_dropout_prob=0.0,
+    is_training=False,
 ):
     """
     Run ControlNet + U-Net to obtain the denoising network output (and optionally
@@ -187,7 +201,23 @@ def compute_model_output(
     include_body_region = (top_region_index_tensor is not None) and (bottom_region_index_tensor is not None)
 
     # use binary encoding to encode segmentation mask
-    controlnet_cond = binarize_labels(labels.as_tensor().to(torch.long)).float()
+    # controlnet_cond = binarize_labels(labels.as_tensor().to(torch.long)).float()
+
+    mask_cond = binarize_labels(labels.as_tensor().to(torch.long)).float()
+
+    text_cond = build_text_control_channels(
+        text_prompts=text_prompts,
+        labels=labels,
+        text_encoder=text_encoder,
+        text_projector=text_projector,
+        target_text_labels=target_text_labels,
+        out_channels=text_condition_num_channels,
+        mode=text_condition_mode,
+        dropout_prob=text_dropout_prob,
+        is_training=is_training,
+    ).to(device=mask_cond.device, dtype=mask_cond.dtype)
+
+    controlnet_cond = torch.cat([mask_cond, text_cond], dim=1)
 
     # create noisy latent
     noisy_latent = noise_scheduler.add_noise(original_samples=images, noise=noise, timesteps=timesteps)
@@ -236,6 +266,65 @@ def compute_model_output(
     else:
         return model_output, None, None
 
+def load_controlnet_with_expanded_condition_channels(
+    controlnet: torch.nn.Module,
+    checkpoint_path: str,
+    device: torch.device,
+    logger: logging.Logger,
+    state_key: str = "controlnet_state_dict",
+):
+    """
+    Load old 8-channel ControlNet weights into new 16-channel ControlNet.
+
+    Matching-shape tensors are copied normally.
+    For the first condition-embedding Conv3D with input-channel mismatch,
+    copy the old first 8 channels and leave the new text channels initialized.
+    """
+
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    old_sd = ckpt[state_key] if state_key in ckpt else ckpt
+    new_sd = controlnet.state_dict()
+
+    loaded = []
+    expanded = []
+    skipped = []
+
+    for k, old_v in old_sd.items():
+        if k not in new_sd:
+            skipped.append(k)
+            continue
+
+        new_v = new_sd[k]
+
+        if new_v.shape == old_v.shape:
+            new_sd[k] = old_v
+            loaded.append(k)
+            continue
+
+        # Conv3D weight shape: [out_ch, in_ch, kx, ky, kz]
+        # This catches the condition embedding conv where in_ch changed 8 -> 16.
+        if (
+            old_v.ndim == 5
+            and new_v.ndim == 5
+            and new_v.shape[0] == old_v.shape[0]
+            and new_v.shape[2:] == old_v.shape[2:]
+            and new_v.shape[1] > old_v.shape[1]
+        ):
+            tmp = new_v.clone()
+            tmp[:, : old_v.shape[1], ...] = old_v
+            # Keep text-channel weights at init. Since TextToControlChannels starts at zero,
+            # this is safe and minimally disruptive.
+            new_sd[k] = tmp
+            expanded.append((k, tuple(old_v.shape), tuple(new_v.shape)))
+            continue
+
+        skipped.append(k)
+
+    controlnet.load_state_dict(new_sd, strict=True)
+
+    logger.info(f"Loaded {len(loaded)} matching ControlNet tensors.")
+    logger.info(f"Expanded {len(expanded)} tensors for text channels: {expanded}")
+    logger.info(f"Skipped {len(skipped)} tensors: {skipped[:20]}")
 
 def train_controlnet(env_config_path: str, model_config_path: str, model_def_path: str, num_gpus: int) -> None:
     # Step 0: configuration
@@ -303,13 +392,54 @@ def train_controlnet(env_config_path: str, model_config_path: str, model_def_pat
 
     # define ControlNet
     controlnet = define_instance(args, "controlnet_def").to(device)
+    
+    # Text conditioning config
+    args.text_encoder_name = getattr(
+        args,
+        "text_encoder_name",
+        "emilyalsentzer/Bio_ClinicalBERT",
+    )
+    args.text_condition_num_channels = int(getattr(args, "text_condition_num_channels", 8))
+    args.text_condition_mode = getattr(args, "text_condition_mode", "roi_gated")
+    args.text_dropout_prob = float(getattr(args, "text_dropout_prob", 0.10))
+
+    # Usually this should be the same as weighted_loss_label, e.g. [23] for lung tumor
+    args.target_text_labels = getattr(
+        args,
+        "target_text_labels",
+        args.controlnet_train.get("weighted_loss_label", []),
+    )
+
+    text_encoder = FrozenClinicalBERT(
+        model_name=args.text_encoder_name,
+        max_length=int(getattr(args, "text_max_length", 128)),
+    ).to(device)
+    text_encoder.eval()
+
+    text_projector = TextToControlChannels(
+        text_dim=text_encoder.hidden_size,
+        out_channels=args.text_condition_num_channels,
+        hidden_dim=int(getattr(args, "text_projector_hidden_dim", 128)),
+    ).to(device)
+
+    logger.info(f"Using text encoder: {args.text_encoder_name}")
+    logger.info(f"Text channels: {args.text_condition_num_channels}")
+    logger.info(f"Text condition mode: {args.text_condition_mode}")
+    logger.info(f"Target text labels: {args.target_text_labels}")
+    
     # copy weights from the DM to the controlnet
     copy_model_state(controlnet, unet.state_dict())
     # load trained controlnet model if it is provided
     if args.existing_ckpt_filepath is not None:
         if not os.path.exists(args.existing_ckpt_filepath):
             raise ValueError("Please download the trained ControlNet checkpoint.")
-        controlnet.load_state_dict(torch.load(args.existing_ckpt_filepath, map_location=device, weights_only=False)["controlnet_state_dict"])
+        # controlnet.load_state_dict(torch.load(args.existing_ckpt_filepath, map_location=device, weights_only=False)["controlnet_state_dict"])
+        load_controlnet_with_expanded_condition_channels(
+            controlnet=controlnet,
+            checkpoint_path=args.existing_ckpt_filepath,
+            device=device,
+            logger=logger,
+        )
         logger.info(f"load trained controlnet model from {args.existing_ckpt_filepath}")
     else:
         logger.info("train controlnet model from scratch.")
@@ -348,7 +478,11 @@ def train_controlnet(env_config_path: str, model_config_path: str, model_def_pat
     # Step 3: training config
     weighted_loss = args.controlnet_train["weighted_loss"]
     weighted_loss_label = args.controlnet_train["weighted_loss_label"]
-    optimizer = torch.optim.AdamW(params=controlnet.parameters(), lr=args.controlnet_train["lr"])
+    # optimizer = torch.optim.AdamW(params=controlnet.parameters(), lr=args.controlnet_train["lr"])
+    optimizer = torch.optim.AdamW(
+        params=list(controlnet.parameters()) + list(text_projector.parameters()),
+        lr=args.controlnet_train["lr"],
+    )
     total_steps = (args.controlnet_train["n_epochs"] * len(train_loader.dataset)) / args.controlnet_train["batch_size"]
     logger.info(f"total number of training steps: {total_steps}.")
 
@@ -372,6 +506,12 @@ def train_controlnet(env_config_path: str, model_config_path: str, model_def_pat
             # get image embedding and label mask and scale image embedding by the provided scale_factor
             images = batch["image"].to(device) * scale_factor
             labels = batch["label"].to(device)
+            text_prompts = batch.get("text", None)
+            if text_prompts is None:
+                raise ValueError(
+                    "Batch does not contain key 'text'. "
+                    "Add a 'text' field to every item in your training JSON."
+                )
             if labels.shape[1] != 1:
                 raise ValueError(f"We expect labels with shape [B,1,X,Y,Z], yet got {labels.shape}")
             # get corresponding conditions
@@ -400,6 +540,20 @@ def train_controlnet(env_config_path: str, model_config_path: str, model_def_pat
                     timesteps = noise_scheduler.sample_timesteps(images)
                 else:
                     timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (images.shape[0],), device=images.device).long()
+                # (model_output, model_block1_output, model_block2_output) = compute_model_output(
+                #     images,
+                #     labels,
+                #     noise,
+                #     timesteps,
+                #     noise_scheduler,
+                #     controlnet,
+                #     unet,
+                #     spacing_tensor,
+                #     modality_tensor,
+                #     top_region_index_tensor,
+                #     bottom_region_index_tensor,
+                #     return_controlnet_blocks=False,
+                # )
                 (model_output, model_block1_output, model_block2_output) = compute_model_output(
                     images,
                     labels,
@@ -413,13 +567,17 @@ def train_controlnet(env_config_path: str, model_config_path: str, model_def_pat
                     top_region_index_tensor,
                     bottom_region_index_tensor,
                     return_controlnet_blocks=False,
+                    text_prompts=text_prompts,
+                    text_encoder=text_encoder,
+                    text_projector=text_projector,
+                    text_condition_num_channels=args.text_condition_num_channels,
+                    text_condition_mode=args.text_condition_mode,
+                    target_text_labels=args.target_text_labels,
+                    text_dropout_prob=args.text_dropout_prob,
+                    is_training=True,
                 )
                 if args.use_region_contrasive_loss:
-                    (
-                        model_output_roi_free,
-                        model_block1_output_roi_free,
-                        model_block2_output_roi_free,
-                    ) = compute_model_output(
+                    (model_output_roi_free, model_block1_output_roi_free, model_block2_output_roi_free) = compute_model_output(
                         images,
                         labels_roi_free,
                         noise,
@@ -432,6 +590,14 @@ def train_controlnet(env_config_path: str, model_config_path: str, model_def_pat
                         top_region_index_tensor,
                         bottom_region_index_tensor,
                         return_controlnet_blocks=False,
+                        text_prompts=[""] * images.shape[0],
+                        text_encoder=text_encoder,
+                        text_projector=text_projector,
+                        text_condition_num_channels=args.text_condition_num_channels,
+                        text_condition_mode="zero",
+                        target_text_labels=args.target_text_labels,
+                        text_dropout_prob=0.0,
+                        is_training=True,
                     )
 
                 if isinstance(noise_scheduler, RFlowScheduler):
@@ -509,11 +675,19 @@ def train_controlnet(env_config_path: str, model_config_path: str, model_def_pat
             tensorboard_writer.add_scalar("train/train_controlnet_loss_epoch", epoch_loss.cpu().item(), total_step)
             # save controlnet only on master GPU (rank 0)
             controlnet_state_dict = controlnet.module.state_dict() if world_size > 1 else controlnet.state_dict()
+            controlnet_state_dict = controlnet.module.state_dict() if world_size > 1 else controlnet.state_dict()
+            text_projector_state_dict = text_projector.module.state_dict() if world_size > 1 else text_projector.state_dict()
+
             torch.save(
                 {
                     "epoch": epoch + 1,
                     "loss": epoch_loss,
                     "controlnet_state_dict": controlnet_state_dict,
+                    "text_projector_state_dict": text_projector_state_dict,
+                    "text_encoder_name": args.text_encoder_name,
+                    "text_condition_num_channels": args.text_condition_num_channels,
+                    "text_condition_mode": args.text_condition_mode,
+                    "target_text_labels": args.target_text_labels,
                 },
                 f"{args.model_dir}/{args.exp_name}_current.pt",
             )
@@ -522,11 +696,19 @@ def train_controlnet(env_config_path: str, model_config_path: str, model_def_pat
             if epoch_loss < best_loss:
                 best_loss = epoch_loss
                 logger.info(f"best loss -> {best_loss}.")
+                controlnet_state_dict = controlnet.module.state_dict() if world_size > 1 else controlnet.state_dict()
+                text_projector_state_dict = text_projector.module.state_dict() if world_size > 1 else text_projector.state_dict()
+
                 torch.save(
                     {
                         "epoch": epoch + 1,
-                        "loss": best_loss,
+                        "loss": epoch_loss,
                         "controlnet_state_dict": controlnet_state_dict,
+                        "text_projector_state_dict": text_projector_state_dict,
+                        "text_encoder_name": args.text_encoder_name,
+                        "text_condition_num_channels": args.text_condition_num_channels,
+                        "text_condition_mode": args.text_condition_mode,
+                        "target_text_labels": args.target_text_labels,
                     },
                     f"{args.model_dir}/{args.exp_name}_best.pt",
                 )
