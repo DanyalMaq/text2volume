@@ -321,8 +321,8 @@ def prepare_maisi_controlnet_json_dataloader(
             num_partitions=world_size,
             even_divisible=True,
         )[rank]
-    train_ds = CacheDataset(data=list_train, transform=train_transforms, cache_rate=cache_rate, num_workers=8)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
+    train_ds = CacheDataset(data=list_train, transform=train_transforms, cache_rate=cache_rate, num_workers=2)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
     if use_ddp:
         list_valid = partition_dataset(
             data=list_valid,

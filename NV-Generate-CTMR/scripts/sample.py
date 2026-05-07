@@ -38,6 +38,8 @@ from .utils import (
     remap_labels,
 )
 
+from scripts.text_conditioning import build_text_control_channels
+
 
 class ReconModel(torch.nn.Module):
     """
@@ -201,6 +203,12 @@ def ldm_conditional_sample_one_image(
     autoencoder_sliding_window_infer_size=[96, 96, 96],
     autoencoder_sliding_window_infer_overlap=0.6667,
     cfg_guidance_scale=0,
+    text_prompt=None,
+    text_encoder=None,
+    text_projector=None,
+    text_condition_num_channels=8,
+    text_condition_mode="roi_gated",
+    target_text_labels=None,
 ):
     """
     Generate a single synthetic image using a latent diffusion model with controlnet.
@@ -259,7 +267,44 @@ def ldm_conditional_sample_one_image(
             )
             combine_label = torch.nn.functional.interpolate(combine_label, size=output_size, mode="nearest")
 
-        controlnet_cond_vis = binarize_labels(combine_label.as_tensor().long()).half()
+        # controlnet_cond_vis = binarize_labels(combine_label.as_tensor().long()).half()
+
+        # ------------------------------------------------------------
+        # Text-augmented ControlNet condition
+        #
+        # Original MAISI:
+        #   mask_cond = [B, 8, H, W, D]
+        #
+        # Our modified version:
+        #   mask_cond = [B, 8, H, W, D]
+        #   text_cond = [B, 8, H, W, D]
+        #   controlnet_cond_vis = [B, 16, H, W, D]
+        # ------------------------------------------------------------
+
+        mask_cond = binarize_labels(combine_label.as_tensor().long()).float()
+
+        if text_prompt is not None and text_encoder is not None and text_projector is not None:
+            text_cond = build_text_control_channels(
+                text_prompts=text_prompt,
+                labels=combine_label,
+                text_encoder=text_encoder,
+                text_projector=text_projector,
+                target_text_labels=target_text_labels,
+                out_channels=text_condition_num_channels,
+                mode=text_condition_mode,
+                dropout_prob=0.0,
+                is_training=False,
+            ).to(device=mask_cond.device, dtype=mask_cond.dtype)
+        else:
+            text_cond = torch.zeros(
+                mask_cond.shape[0],
+                text_condition_num_channels,
+                *mask_cond.shape[2:],
+                device=mask_cond.device,
+                dtype=mask_cond.dtype,
+            )
+
+        controlnet_cond_vis = torch.cat([mask_cond, text_cond], dim=1).half()
 
         # Generate random noise
         latents = initialize_noise_latents(latent_shape, device) * noise_factor
@@ -294,8 +339,33 @@ def ldm_conditional_sample_one_image(
             combine_label_no_tumor = torch.nn.functional.interpolate(
                 remove_tumors(combine_label.squeeze(0)).unsqueeze(0).float(), size=output_size, mode="nearest"
             ).to(combine_label.dtype)
-            controlnet_cond_vis_no_tumor = binarize_labels(combine_label_no_tumor.as_tensor().long()).half()
+            # controlnet_cond_vis_no_tumor = binarize_labels(combine_label_no_tumor.as_tensor().long()).half()
+            mask_cond_no_tumor = binarize_labels(
+                combine_label_no_tumor.as_tensor().long()
+            ).float()
+
+            zero_text_cond_no_tumor = torch.zeros(
+                mask_cond_no_tumor.shape[0],
+                text_condition_num_channels,
+                *mask_cond_no_tumor.shape[2:],
+                device=mask_cond_no_tumor.device,
+                dtype=mask_cond_no_tumor.dtype,
+            )
+
+            controlnet_cond_vis_no_tumor = torch.cat(
+                [mask_cond_no_tumor, zero_text_cond_no_tumor],
+                dim=1,
+            ).half()
             del combine_label_no_tumor
+
+        if not hasattr(ldm_conditional_sample_one_image, "_printed_text_condition_shapes"):
+            print("[TEXT INFER] combine_label:", tuple(combine_label.as_tensor().shape))
+            print("[TEXT INFER] mask_cond:", tuple(mask_cond.shape), mask_cond.dtype)
+            print("[TEXT INFER] text_cond:", tuple(text_cond.shape), text_cond.dtype)
+            print("[TEXT INFER] controlnet_cond_vis:", tuple(controlnet_cond_vis.shape), controlnet_cond_vis.dtype)
+            print("[TEXT INFER] text_prompt:", text_prompt)
+            ldm_conditional_sample_one_image._printed_text_condition_shapes = True
+        
         for t, next_t in progress_bar:
             # get controlnet output
             # Create a dictionary to store the inputs
@@ -669,6 +739,12 @@ class LDMSampler:
         autoencoder_sliding_window_infer_size=[96, 96, 96],
         autoencoder_sliding_window_infer_overlap=0.6667,
         cfg_guidance_scale=0.0,
+        text_prompt=None,
+        text_encoder=None,
+        text_projector=None,
+        text_condition_num_channels=8,
+        text_condition_mode="roi_gated",
+        target_text_labels=None,
     ) -> None:
         """
         Initialize the LDMSampler with various parameters and models.
@@ -716,6 +792,13 @@ class LDMSampler:
         # Set the default value for number of inference steps to 1000
         self.num_inference_steps = num_inference_steps if num_inference_steps is not None else 1000
         self.mask_generation_num_inference_steps = mask_generation_num_inference_steps if mask_generation_num_inference_steps is not None else 1000
+
+        self.text_prompt = text_prompt
+        self.text_encoder = text_encoder
+        self.text_projector = text_projector
+        self.text_condition_num_channels = text_condition_num_channels
+        self.text_condition_mode = text_condition_mode
+        self.target_text_labels = target_text_labels if target_text_labels is not None else [23]
 
         if any(size % 16 != 0 for size in autoencoder_sliding_window_infer_size):
             raise ValueError(f"autoencoder_sliding_window_infer_size must be divisible by 16.\n Got {autoencoder_sliding_window_infer_size}")
@@ -959,6 +1042,12 @@ class LDMSampler:
             autoencoder_sliding_window_infer_size=self.autoencoder_sliding_window_infer_size,
             autoencoder_sliding_window_infer_overlap=self.autoencoder_sliding_window_infer_overlap,
             cfg_guidance_scale=self.cfg_guidance_scale,
+            text_prompt=self.text_prompt,
+            text_encoder=self.text_encoder,
+            text_projector=self.text_projector,
+            text_condition_num_channels=self.text_condition_num_channels,
+            text_condition_mode=self.text_condition_mode,
+            target_text_labels=self.target_text_labels,
         )
         return synthetic_images, synthetic_labels
 

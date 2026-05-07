@@ -203,6 +203,12 @@ def compute_model_output(
     # use binary encoding to encode segmentation mask
     # controlnet_cond = binarize_labels(labels.as_tensor().to(torch.long)).float()
 
+    # labels_for_controlnet = F.interpolate(
+    #     labels.float(),
+    #     size=images.shape[2:],
+    #     mode="nearest",
+    # ).long()
+
     mask_cond = binarize_labels(labels.as_tensor().to(torch.long)).float()
 
     text_cond = build_text_control_channels(
@@ -329,6 +335,13 @@ def load_controlnet_with_expanded_condition_channels(
 def train_controlnet(env_config_path: str, model_config_path: str, model_def_path: str, num_gpus: int) -> None:
     # Step 0: configuration
     logger = logging.getLogger("maisi.controlnet.training")
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+    logger.setLevel(logging.INFO)
+
     # whether to use distributed data parallel
     use_ddp = num_gpus > 1
     if use_ddp:
@@ -451,6 +464,7 @@ def train_controlnet(env_config_path: str, model_config_path: str, model_def_pat
 
     if use_ddp:
         controlnet = DDP(controlnet, device_ids=[device], output_device=rank, find_unused_parameters=True)
+        text_projector = DDP(text_projector, device_ids=[device], output_device=rank, find_unused_parameters=False)
 
     # set data loader
     if include_modality:
@@ -554,6 +568,18 @@ def train_controlnet(env_config_path: str, model_config_path: str, model_def_pat
                 #     bottom_region_index_tensor,
                 #     return_controlnet_blocks=False,
                 # )
+
+                # if torch.distributed.is_initialized():
+                #     rank = torch.distributed.get_rank()
+                # else:
+                #     rank = 0
+
+                # if rank == 0:
+                #     print("images.shape:", tuple(images.shape), images.dtype, images.device)
+                #     print("labels.shape:", tuple(labels.shape), labels.dtype, labels.device)
+                #     print("controlnet_cond.shape:", tuple(controlnet_cond.shape), controlnet_cond.dtype, controlnet_cond.device)
+                #     print("controlnet_cond GB:", controlnet_cond.numel() * controlnet_cond.element_size() / 1024**3)
+
                 (model_output, model_block1_output, model_block2_output) = compute_model_output(
                     images,
                     labels,
@@ -620,7 +646,12 @@ def train_controlnet(env_config_path: str, model_config_path: str, model_def_pat
                 if weighted_loss > 1.0:
                     weights = torch.ones_like(images).to(images.device)
                     roi = torch.zeros([noise_shape[0]] + [1] + noise_shape[2:]).to(images.device)
-                    interpolate_label = F.interpolate(labels, size=images.shape[2:], mode="nearest")
+                    # interpolate_label = F.interpolate(labels, size=images.shape[2:], mode="nearest")
+                    interpolate_label = F.interpolate(
+                        labels.float(),
+                        size=images.shape[2:],
+                        mode="nearest",
+                    ).long()
                     # assign larger weights for ROI (tumor)
                     for label in weighted_loss_label:
                         roi[interpolate_label == label] = 1

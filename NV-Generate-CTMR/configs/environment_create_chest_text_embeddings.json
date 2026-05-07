@@ -1,0 +1,11 @@
+{
+    "model_dir": "models/",
+    "output_dir": "outputs",
+    "tfevent_path": "outputs/tfevent",
+  
+    "trained_autoencoder_path": "models/autoencoder_v1.pt",
+  
+    "data_base_dir": "datasets/rexgrounding",
+    "json_data_list": "datasets/rexgrounding_processed/raw_image_list_for_embeddings.json",
+    "embedding_base_dir": "datasets/rexgrounding_processed/embeddings"
+}

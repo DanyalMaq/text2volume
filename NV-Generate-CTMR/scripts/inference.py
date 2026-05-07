@@ -25,6 +25,7 @@ from scripts.download_model_data import download_model_data
 from scripts.sample import LDMSampler, check_input_ct, check_input_mr
 from scripts.utils import define_instance
 
+from scripts.text_conditioning import FrozenClinicalBERT, TextToControlChannels
 
 def main():
     parser = argparse.ArgumentParser(description="maisi.controlnet.training")
@@ -170,6 +171,62 @@ def main():
     monai.networks.utils.copy_model_state(controlnet, diffusion_unet.state_dict())
     controlnet.load_state_dict(checkpoint_controlnet["controlnet_state_dict"], strict=False)
 
+    # ------------------------------------------------------------
+    # Load frozen ClinicalBERT + trained text projector
+    # ------------------------------------------------------------
+
+    text_encoder_name = getattr(
+        args,
+        "text_encoder_name",
+        checkpoint_controlnet.get("text_encoder_name", "emilyalsentzer/Bio_ClinicalBERT"),
+    )
+
+    text_max_length = int(getattr(args, "text_max_length", 128))
+
+    text_condition_num_channels = int(
+        getattr(
+            args,
+            "text_condition_num_channels",
+            checkpoint_controlnet.get("text_condition_num_channels", 8),
+        )
+    )
+
+    text_condition_mode = getattr(
+        args,
+        "text_condition_mode",
+        checkpoint_controlnet.get("text_condition_mode", "roi_gated"),
+    )
+
+    target_text_labels = getattr(
+        args,
+        "target_text_labels",
+        checkpoint_controlnet.get("target_text_labels", [23]),
+    )
+
+    text_projector_hidden_dim = int(getattr(args, "text_projector_hidden_dim", 128))
+
+    text_encoder = FrozenClinicalBERT(
+        model_name=text_encoder_name,
+        max_length=text_max_length,
+    ).to(device)
+
+    text_encoder.eval()
+
+    text_projector = TextToControlChannels(
+        text_dim=text_encoder.hidden_size,
+        out_channels=text_condition_num_channels,
+        hidden_dim=text_projector_hidden_dim,
+    ).to(device)
+
+    text_projector.load_state_dict(checkpoint_controlnet["text_projector_state_dict"])
+    text_projector.eval()
+
+    print("[TEXT INFER] text_encoder_name:", text_encoder_name)
+    print("[TEXT INFER] text_condition_num_channels:", text_condition_num_channels)
+    print("[TEXT INFER] text_condition_mode:", text_condition_mode)
+    print("[TEXT INFER] target_text_labels:", target_text_labels)
+    print("[TEXT INFER] text_prompt:", getattr(args, "text_prompt", None))
+
     mask_generation_autoencoder = define_instance(args, "mask_generation_autoencoder").to(device)
     checkpoint_mask_generation_autoencoder = torch.load(args.trained_mask_generation_autoencoder_path, weights_only=True)
     mask_generation_autoencoder.load_state_dict(checkpoint_mask_generation_autoencoder)
@@ -215,6 +272,12 @@ def main():
         autoencoder_sliding_window_infer_size=args.autoencoder_sliding_window_infer_size,
         autoencoder_sliding_window_infer_overlap=args.autoencoder_sliding_window_infer_overlap,
         cfg_guidance_scale=args.cfg_guidance_scale,
+        text_prompt=getattr(args, "text_prompt", None),
+        text_encoder=text_encoder,
+        text_projector=text_projector,
+        text_condition_num_channels=text_condition_num_channels,
+        text_condition_mode=text_condition_mode,
+        target_text_labels=target_text_labels,
     )
 
     logger.info(f"The generated image/mask pairs will be saved in {args.output_dir}.")
