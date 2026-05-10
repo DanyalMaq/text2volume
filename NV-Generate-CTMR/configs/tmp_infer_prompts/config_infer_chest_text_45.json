@@ -1,0 +1,47 @@
+{
+  "num_output_samples": 1,
+  "body_region": [
+    "chest"
+  ],
+  "anatomy_list": [
+    "lung tumor"
+  ],
+  "controllable_anatomy_size": [],
+  "mask_generation_num_inference_steps": 1000,
+  "output_size": [
+    256,
+    256,
+    128
+  ],
+  "spacing": [
+    1.5,
+    1.5,
+    2
+  ],
+  "modality": 1,
+  "image_output_ext": ".nii.gz",
+  "label_output_ext": ".nii.gz",
+  "num_inference_steps": 30,
+  "cfg_guidance_scale": 2,
+  "noise_factor": 1,
+  "autoencoder_sliding_window_infer_size": [
+    48,
+    48,
+    48
+  ],
+  "autoencoder_sliding_window_infer_overlap": 0.6666,
+  "controlnet": "$@controlnet_def",
+  "diffusion_unet": "$@diffusion_unet_def",
+  "autoencoder": "$@autoencoder_def",
+  "mask_generation_autoencoder": "$@mask_generation_autoencoder_def",
+  "mask_generation_diffusion": "$@mask_generation_diffusion_def",
+  "text_prompt": "5 mm nonspecific pulmonary nodule in the laterobasal segment of the left lower lobe",
+  "text_encoder_name": "emilyalsentzer/Bio_ClinicalBERT",
+  "text_max_length": 128,
+  "text_condition_num_channels": 8,
+  "text_condition_mode": "roi_gated",
+  "text_projector_hidden_dim": 128,
+  "target_text_labels": [
+    23
+  ]
+}

@@ -28,7 +28,7 @@
     "mask_generation_autoencoder": "$@mask_generation_autoencoder_def",
     "mask_generation_diffusion": "$@mask_generation_diffusion_def",
 
-    "text_prompt": "Linear fibrotic bands in the right lung upper lobe anterior segment",
+    "text_prompt": "fibrotic bands in the right lung upper lobe",
     "text_encoder_name": "emilyalsentzer/Bio_ClinicalBERT",
     "text_max_length": 128,
     "text_condition_num_channels": 8,
